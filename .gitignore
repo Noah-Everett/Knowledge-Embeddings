@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data artifacts (large/generated)
+# ArXiv dumps
+arxiv-*.jsonl
+
+# Model/checkpoint files
+*.ckpt
+
+# Embedding artifacts
+hepex-embeddings.npz
+*-embeddings.npz
