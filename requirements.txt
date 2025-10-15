@@ -1,0 +1,6 @@
+sickle==0.7.0
+requests>=2.20
+# Optional: for clustering utilities
+numpy
+scikit-learn
+pandas
