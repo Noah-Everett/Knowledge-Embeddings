@@ -48,3 +48,11 @@ See `requirements.txt`. Install with:
 ```bash
 python3 -m pip install -r requirements.txt
 ```
+
+Notebooks
+
+- `01-embed.ipynb`: Load JSONL metadata, build SPECTER2 embeddings, and save to `hepex-embeddings.npz`.
+- `02-pca.ipynb`: Load `.npz` and visualize a 2D PCA colored by category.
+- `03-closest-pairs.ipynb`: Find closest paper pairs in the embedding space.
+- `04-clusters-cross-category.ipynb`: Cluster per category and report closest cross-category clusters.
+- `05-success-analysis.ipynb`: Find nearest neighbors to a synthetic "success" vector.

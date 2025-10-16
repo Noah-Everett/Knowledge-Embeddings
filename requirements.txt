@@ -4,3 +4,10 @@ requests>=2.20
 numpy
 scikit-learn
 pandas
+
+# For embedding and analysis notebooks
+torch
+transformers
+adapter-transformers
+tqdm
+matplotlib

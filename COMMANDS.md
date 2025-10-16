@@ -1,0 +1,1 @@
+python3 ./arxiv_metadata_harvester.py --from-date 2000-01-01 --until-date 2019-12-31 --set hep-ex --output arxiv-2000-2019-hepex.jsonl --checkpoint checkpoint-2025-hepex.ckpt --chunk-days 30 --batch-delay 0.2

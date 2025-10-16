@@ -18,5 +18,4 @@ arxiv-*.jsonl
 *.ckpt
 
 # Embedding artifacts
-hepex-embeddings.npz
-*-embeddings.npz
+*.npz
