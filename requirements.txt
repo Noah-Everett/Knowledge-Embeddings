@@ -11,3 +11,6 @@ transformers
 adapter-transformers
 tqdm
 matplotlib
+
+# For local model scoring via Ollama
+ollama

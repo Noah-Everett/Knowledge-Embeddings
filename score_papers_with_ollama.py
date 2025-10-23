@@ -2,35 +2,37 @@
 """
 Score arXiv papers (title + abstract) with a local Ollama model.
 
-Reads a JSONL file with objects containing at least {"id", "title", "abstract"}
-and writes a JSONL file with an object per input id containing model-generated
-scores across several criteria plus a brief rationale.
+Optimized for speed on Apple Silicon (M1 Pro MBP):
+- Uses the official `ollama` Python client (low overhead) and one-paper-per-call.
+- Supports parallel jobs via a thread pool (configurable with --workers).
+- Avoids extra passes over data and keeps overhead minimal.
 
-Requirements:
-  - Ollama running locally (default: http://localhost:11434)
-  - Python packages: requests, tqdm (already in requirements.txt)
+Reads a JSONL file containing at least {"id", "title", "abstract"} and writes a
+JSONL file with an object per input id containing model-generated scores across
+several criteria plus a brief rationale.
 
 Example:
-  ./score_papers_with_ollama.py \
-    --input arxiv-2007-2019-hepex.jsonl \
-    --output hepex-ollama-scores.jsonl \
-    --model llama3.1:8b \
-    --limit 1000 --skip-existing
+    ./score_papers_with_ollama.py \
+        --input arxiv-2007-2019-hepex.jsonl \
+        --output hepex-ollama-scores.jsonl \
+        --model llama3.1:8b \
+        --workers 2 --limit 1000 --skip-existing
 
-The output JSONL line schema (one per paper id):
+Output JSONL schema per line:
 {
-  "id": "oai:arXiv.org:XXXX.YYYYY",
-  "title": "...",
-  "scores": {
-    "progress": 1-5,
-    "creativity": 1-5,
-    "novelty": 1-5,
-    "technical_rigor": 1-5,
-    "clarity": 1-5,
-    "potential_impact": 1-5,
-    "overall": 1-5
-  },
-  "rationale": "1-3 sentence justification"
+    "id": "oai:arXiv.org:XXXX.YYYYY",
+    "title": "...",
+    "scores": {
+        "progress": 1-5,
+        "creativity": 1-5,
+        "novelty": 1-5,
+        "technical_rigor": 1-5,
+        "clarity": 1-5,
+        "potential_impact": 1-5,
+        "overall": 1-5
+    },
+    "rationale": "1-3 sentence justification",
+    "model": "..."
 }
 """
 
@@ -39,18 +41,12 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, Iterable, Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, Iterable, Optional, Tuple
 
-import requests
-import importlib.util as _importlib_util
-
-# Optional tqdm progress bar without hard dependency for static analyzers
-_tqdm_spec = _importlib_util.find_spec("tqdm")
-if _tqdm_spec is not None:
-    from tqdm import tqdm as tqdm  # type: ignore
-else:
-    def tqdm(iterable=None, *args, **kwargs):  # type: ignore
-        return iterable if iterable is not None else []
+from ollama import Client
+from tqdm import tqdm
 
 
 DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -124,51 +120,53 @@ def ensure_json(s: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+_THREAD_LOCAL = threading.local()
+
+
+def _get_client(base_url: str) -> Client:
+    cl: Optional[Client] = getattr(_THREAD_LOCAL, "client", None)
+    if cl is None:
+        cl = Client(host=base_url)
+        setattr(_THREAD_LOCAL, "client", cl)
+    return cl
+
+
 def call_ollama(
     model: str,
     prompt: str,
     base_url: str = DEFAULT_OLLAMA_URL,
     retries: int = 3,
-    timeout: int = 120,
+    temperature: float = 0.0,
+    num_ctx: int = 8192,
+    num_predict: int = 256,
 ) -> Dict[str, Any]:
-    """Call Ollama /api/generate with JSON formatting requested.
-
-    Returns parsed JSON object from the model's response under the assumption
-    that we asked for strict JSON output.
-    """
-    url = base_url.rstrip('/') + "/api/generate"
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        # Ask Ollama/runtime to enforce JSON output if supported by the model
-        "format": "json",
-        "stream": False,
-        # Conservative context to fit long abstracts; adjust as needed
-        "options": {"num_ctx": 8192},
-    }
-
+    """Call Ollama via the Python client (one paper per call)."""
     last_exc: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.post(url, json=payload, timeout=timeout)
-            if resp.status_code == 200:
-                data = resp.json()
-                # For /api/generate, the response text is in data["response"].
-                raw = data.get("response", "")
-                obj = ensure_json(raw)
-                if obj is None:
-                    raise ValueError("Model response was not valid JSON")
-                return obj
-            # Retry on transient errors
-            if resp.status_code in (408, 409, 429, 500, 502, 503, 504):
-                time.sleep(min(2 ** attempt, 10))
-                continue
-            # Non-retryable: raise
-            resp.raise_for_status()
+            client = _get_client(base_url)
+            data = client.generate(
+                model=model,
+                prompt=prompt,
+                format="json",
+                stream=False,
+                options={
+                    "temperature": temperature,
+                    "num_ctx": num_ctx,
+                    "num_predict": num_predict,
+                    "seed": 42,
+                },
+            )
+            # ollama client returns dict with key 'response'
+            raw = data.get("response", "")
+            obj = ensure_json(raw)
+            if obj is None:
+                raise ValueError("Model response was not valid JSON")
+            return obj
         except Exception as e:
             last_exc = e
+            # brief exponential backoff
             time.sleep(min(2 ** attempt, 10))
-
     raise RuntimeError(f"Ollama call failed after {retries} attempts: {last_exc}")
 
 
@@ -245,7 +243,50 @@ def parse_args() -> argparse.Namespace:
                    help="End at this 0-based index (exclusive); 0 means process to end")
     p.add_argument("--ollama-url", type=str, default=DEFAULT_OLLAMA_URL,
                    help="Base URL for Ollama (default: http://localhost:11434)")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Number of parallel jobs (each scores one paper at a time)")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="Sampling temperature (lower is more deterministic)")
+    p.add_argument("--num-ctx", type=int, default=8192,
+                   help="Context window tokens for the model")
+    p.add_argument("--num-predict", type=int, default=256,
+                   help="Max tokens to generate (JSON is short; keep small for speed)")
     return p.parse_args()
+
+
+def _process_record(
+    rec: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (paper_id, output_json_line, error_message)."""
+    pid = rec.get("id") or rec.get("arxiv_id") or rec.get("paper_id")
+    title = rec.get("title") or ""
+    abstract = rec.get("abstract") or rec.get("summary") or ""
+
+    if not pid or not title or not abstract:
+        return None, None, "missing required fields"
+
+    prompt = build_prompt(title, abstract)
+    obj = call_ollama(
+        model=args.model,
+        prompt=prompt,
+        base_url=args.ollama_url,
+        temperature=args.temperature,
+        num_ctx=args.num_ctx,
+        num_predict=args.num_predict,
+    )
+    scores = normalize_scores(obj)
+    rationale = obj.get("rationale")
+    if not isinstance(rationale, str):
+        rationale = ""
+    out_obj = {
+        "id": pid,
+        "title": title,
+        "scores": scores,
+        "rationale": rationale.strip(),
+        "model": args.model,
+    }
+    return pid, json.dumps(out_obj, ensure_ascii=False), None
 
 
 def main() -> None:
@@ -263,81 +304,83 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
     fout = open(args.output, "a", encoding="utf-8")
 
-    # Iterate inputs with optional slicing
+    # Iterate inputs with optional slicing, dispatch to worker pool
     it = iter_jsonl(args.input)
     start_i = max(0, int(args.start or 0))
     end_i = int(args.end or 0)
 
     processed = 0
-    total_seen = 0
     failed = 0
+    seen_total = 0
 
-    # We don't know the total count cheaply without scanning; tqdm will be unbounded
-    for idx, rec in enumerate(it):
-        if idx < start_i:
-            continue
-        if end_i and idx >= end_i:
-            break
+    max_workers = max(1, int(args.workers or 1))
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = set()
 
+    def maybe_submit(rec: Dict[str, Any]):
+        nonlocal processed, failed
         pid = rec.get("id") or rec.get("arxiv_id") or rec.get("paper_id")
         title = rec.get("title") or ""
         abstract = rec.get("abstract") or rec.get("summary") or ""
-
-        total_seen += 1
-
         if not pid or not title or not abstract:
-            # Skip records without required fields
-            continue
-
+            return
         if seen_ids and pid in seen_ids:
-            continue
+            return
+        futures.add(executor.submit(_process_record, rec, args))
 
-        prompt = build_prompt(title, abstract)
-        try:
-            obj = call_ollama(
-                model=args.model,
-                prompt=prompt,
-                base_url=args.ollama_url,
-            )
-            scores = normalize_scores(obj)
-            rationale = obj.get("rationale")
-            if not isinstance(rationale, str) or not rationale.strip():
-                rationale = ""  # keep empty if model omitted
+    with tqdm(desc="Scoring", unit="paper") as pbar:
+        for idx, rec in enumerate(it):
+            if idx < start_i:
+                continue
+            if end_i and idx >= end_i:
+                break
+            seen_total += 1
+            maybe_submit(rec)
 
-            out_obj = {
-                "id": pid,
-                "title": title,
-                "scores": scores,
-                "rationale": rationale.strip(),
-                "model": args.model,
-            }
-            fout.write(json.dumps(out_obj, ensure_ascii=False) + "\n")
-            fout.flush()
-            processed += 1
-        except Exception as e:
-            failed += 1
-            # Log minimal error and continue
-            sys.stderr.write(f"[warn] failed on {pid}: {e}\n")
+            # Drain completed futures to keep memory bounded
+            done = [f for f in list(futures) if f.done()]
+            for f in done:
+                futures.remove(f)
+                pid, line, err = f.result()
+                if err is None and line is not None:
+                    fout.write(line + "\n")
+                    processed += 1
+                else:
+                    failed += 1
+                    if pid:
+                        sys.stderr.write(f"[warn] failed on {pid}: {err}\n")
+                pbar.update(1)
+                if args.limit and processed >= args.limit:
+                    break
+            if args.limit and processed >= args.limit:
+                break
 
-        if args.limit and processed >= args.limit:
-            break
+        # Flush remaining futures
+        for f in as_completed(list(futures)):
+            pid, line, err = f.result()
+            if err is None and line is not None:
+                fout.write(line + "\n")
+                processed += 1
+            else:
+                failed += 1
+                if pid:
+                    sys.stderr.write(f"[warn] failed on {pid}: {err}\n")
+            pbar.update(1)
 
+    executor.shutdown(wait=True)
     fout.close()
 
-    print(
-        json.dumps(
-            {
-                "processed": processed,
-                "skipped_existing": len(seen_ids) if seen_ids else 0,
-                "failed": failed,
-                "seen": total_seen,
-                "start": start_i,
-                "end": end_i,
-                "output": os.path.abspath(args.output),
-            },
-            indent=2,
-        )
-    )
+    summary = {
+        "processed": processed,
+        "skipped_existing": len(seen_ids) if seen_ids else 0,
+        "failed": failed,
+        "seen": seen_total,
+        "start": start_i,
+        "end": end_i,
+        "workers": max_workers,
+        "output": os.path.abspath(args.output),
+    }
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
