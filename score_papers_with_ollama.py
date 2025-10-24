@@ -11,7 +11,7 @@ Reads a JSONL file containing at least {"id", "title", "abstract"} and writes a
 JSONL file with an object per input id containing model-generated scores across
 several criteria plus a brief rationale.
 
-Example:
+Example (lean only):
     ./score_papers_with_ollama.py \
         --input arxiv-2007-2019-hepex.jsonl \
         --output hepex-ollama-scores.jsonl \
@@ -34,6 +34,12 @@ Output JSONL schema per line:
     "rationale": "1-3 sentence justification",
     "model": "..."
 }
+
+    Full-output mode:
+    - Pass --full-output <path> to write records that include ALL original input fields
+        plus appended {scores, rationale, model}.
+        You can write both lean and full outputs in one pass by providing both --output
+        and --full-output.
 """
 
 import argparse
@@ -206,22 +212,23 @@ def iter_jsonl(path: str) -> Iterable[Dict[str, Any]]:
                 continue
 
 
-def load_processed_ids(path: str) -> set:
-    seen = set()
-    if not os.path.exists(path):
-        return seen
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                    pid = obj.get("id")
-                    if pid:
-                        seen.add(pid)
-                except Exception:
-                    continue
-    except Exception:
-        pass
+def load_processed_ids(paths: Iterable[str]) -> set:
+    seen: set = set()
+    for path in paths:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                        pid = obj.get("id")
+                        if pid:
+                            seen.add(pid)
+                    except Exception:
+                        continue
+        except Exception:
+            continue
     return seen
 
 
@@ -231,6 +238,8 @@ def parse_args() -> argparse.Namespace:
                    help="Path to input JSONL file with fields id, title, abstract")
     p.add_argument("--output", "-o", type=str, default="ollama-scores.jsonl",
                    help="Path to output JSONL file to write scores")
+    p.add_argument("--full-output", type=str, default="",
+                   help="Optional: path to write full JSONL (original fields + appended scores)")
     p.add_argument("--model", "-m", type=str, default="llama3.1:8b",
                    help="Ollama model name (e.g., 'llama3.1:8b', 'llama3.2:3b', 'qwen2.5:7b')")
     p.add_argument("--limit", type=int, default=0,
@@ -257,14 +266,14 @@ def parse_args() -> argparse.Namespace:
 def _process_record(
     rec: Dict[str, Any],
     args: argparse.Namespace,
-) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Return (paper_id, output_json_line, error_message)."""
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return (paper_id, lean_json_line, full_json_line, error_message)."""
     pid = rec.get("id") or rec.get("arxiv_id") or rec.get("paper_id")
     title = rec.get("title") or ""
     abstract = rec.get("abstract") or rec.get("summary") or ""
 
     if not pid or not title or not abstract:
-        return None, None, "missing required fields"
+        return None, None, None, "missing required fields"
 
     prompt = build_prompt(title, abstract)
     obj = call_ollama(
@@ -279,14 +288,25 @@ def _process_record(
     rationale = obj.get("rationale")
     if not isinstance(rationale, str):
         rationale = ""
-    out_obj = {
+    lean_obj = {
         "id": pid,
         "title": title,
         "scores": scores,
         "rationale": rationale.strip(),
         "model": args.model,
     }
-    return pid, json.dumps(out_obj, ensure_ascii=False), None
+    full_obj = dict(rec)
+    # Ensure we don't overwrite existing fields unintentionally; append under new keys
+    full_obj["scores"] = scores
+    full_obj["rationale"] = rationale.strip()
+    full_obj["model"] = args.model
+
+    return (
+        pid,
+        json.dumps(lean_obj, ensure_ascii=False),
+        json.dumps(full_obj, ensure_ascii=False),
+        None,
+    )
 
 
 def main() -> None:
@@ -296,13 +316,27 @@ def main() -> None:
         print(f"Input not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    # Determine progress skip set if requested
-    seen_ids = load_processed_ids(args.output) if args.skip_existing else set()
+    # Determine progress skip set if requested (union of output files)
+    out_paths_for_seen = []
+    if args.output:
+        out_paths_for_seen.append(args.output)
+    if args.full_output:
+        out_paths_for_seen.append(args.full_output)
+    seen_ids = load_processed_ids(out_paths_for_seen) if args.skip_existing else set()
 
     # Prepare output file handle (append mode to support resuming)
     out_dir = os.path.dirname(os.path.abspath(args.output)) or "."
     os.makedirs(out_dir, exist_ok=True)
-    fout = open(args.output, "a", encoding="utf-8")
+    fout_lean = None
+    if args.output:
+        out_dir_lean = os.path.dirname(os.path.abspath(args.output)) or "."
+        os.makedirs(out_dir_lean, exist_ok=True)
+        fout_lean = open(args.output, "a", encoding="utf-8")
+    fout_full = None
+    if args.full_output:
+        out_dir_full = os.path.dirname(os.path.abspath(args.full_output)) or "."
+        os.makedirs(out_dir_full, exist_ok=True)
+        fout_full = open(args.full_output, "a", encoding="utf-8")
 
     # Iterate inputs with optional slicing, dispatch to worker pool
     it = iter_jsonl(args.input)
@@ -328,7 +362,7 @@ def main() -> None:
             return
         futures.add(executor.submit(_process_record, rec, args))
 
-    with tqdm(desc="Scoring", unit="paper") as pbar:
+    with tqdm(desc="Scoring", unit=" papers") as pbar:
         for idx, rec in enumerate(it):
             if idx < start_i:
                 continue
@@ -341,10 +375,13 @@ def main() -> None:
             done = [f for f in list(futures) if f.done()]
             for f in done:
                 futures.remove(f)
-                pid, line, err = f.result()
-                if err is None and line is not None:
-                    fout.write(line + "\n")
-                    processed += 1
+                pid, lean_line, full_line, err = f.result()
+                if err is None:
+                    if fout_lean is not None and lean_line is not None:
+                        fout_lean.write(lean_line + "\n")
+                    if fout_full is not None and full_line is not None:
+                        fout_full.write(full_line + "\n")
+                    processed += 1  # count per paper
                 else:
                     failed += 1
                     if pid:
@@ -357,9 +394,12 @@ def main() -> None:
 
         # Flush remaining futures
         for f in as_completed(list(futures)):
-            pid, line, err = f.result()
-            if err is None and line is not None:
-                fout.write(line + "\n")
+            pid, lean_line, full_line, err = f.result()
+            if err is None:
+                if fout_lean is not None and lean_line is not None:
+                    fout_lean.write(lean_line + "\n")
+                if fout_full is not None and full_line is not None:
+                    fout_full.write(full_line + "\n")
                 processed += 1
             else:
                 failed += 1
@@ -368,7 +408,10 @@ def main() -> None:
             pbar.update(1)
 
     executor.shutdown(wait=True)
-    fout.close()
+    if fout_lean is not None:
+        fout_lean.close()
+    if fout_full is not None:
+        fout_full.close()
 
     summary = {
         "processed": processed,
@@ -378,7 +421,8 @@ def main() -> None:
         "start": start_i,
         "end": end_i,
         "workers": max_workers,
-        "output": os.path.abspath(args.output),
+        "output": os.path.abspath(args.output) if args.output else None,
+        "full_output": os.path.abspath(args.full_output) if args.full_output else None,
     }
     print(json.dumps(summary, indent=2))
 
