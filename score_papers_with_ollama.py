@@ -48,6 +48,7 @@ import os
 import sys
 import time
 import threading
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -127,6 +128,7 @@ def ensure_json(s: str) -> Optional[Dict[str, Any]]:
 
 
 _THREAD_LOCAL = threading.local()
+_STOP_EVENT = threading.Event()
 
 
 def _get_client(base_url: str) -> Client:
@@ -149,6 +151,8 @@ def call_ollama(
     """Call Ollama via the Python client (one paper per call)."""
     last_exc: Optional[Exception] = None
     for attempt in range(1, retries + 1):
+        if _STOP_EVENT.is_set():
+            raise RuntimeError("shutdown requested")
         try:
             client = _get_client(base_url)
             data = client.generate(
@@ -171,8 +175,10 @@ def call_ollama(
             return obj
         except Exception as e:
             last_exc = e
-            # brief exponential backoff
-            time.sleep(min(2 ** attempt, 10))
+            # brief exponential backoff that can be interrupted by shutdown
+            wait_s = min(2 ** attempt, 10)
+            if _STOP_EVENT.wait(wait_s):
+                raise RuntimeError("shutdown requested")
     raise RuntimeError(f"Ollama call failed after {retries} attempts: {last_exc}")
 
 
@@ -311,6 +317,14 @@ def _process_record(
 
 def main() -> None:
     args = parse_args()
+    
+    # Handle SIGTERM gracefully (SIGINT raises KeyboardInterrupt by default)
+    def _on_sigterm(signum, frame):
+        _STOP_EVENT.set()
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception:
+        pass
 
     if not os.path.exists(args.input):
         print(f"Input not found: {args.input}", file=sys.stderr)
@@ -362,52 +376,80 @@ def main() -> None:
             return
         futures.add(executor.submit(_process_record, rec, args))
 
-    with tqdm(desc="Scoring", unit=" papers") as pbar:
-        for idx, rec in enumerate(it):
-            if idx < start_i:
-                continue
-            if end_i and idx >= end_i:
-                break
-            seen_total += 1
-            maybe_submit(rec)
+    interrupted = False
+    try:
+        with tqdm(desc="Scoring", unit="paper") as pbar:
+            for idx, rec in enumerate(it):
+                if _STOP_EVENT.is_set():
+                    interrupted = True
+                    break
+                if idx < start_i:
+                    continue
+                if end_i and idx >= end_i:
+                    break
+                seen_total += 1
 
-            # Drain completed futures to keep memory bounded
-            done = [f for f in list(futures) if f.done()]
-            for f in done:
-                futures.remove(f)
+                # Keep at most max_workers tasks in-flight
+                while not _STOP_EVENT.is_set() and len(futures) >= max_workers:
+                    done = [f for f in list(futures) if f.done()]
+                    if not done:
+                        if _STOP_EVENT.wait(0.01):
+                            interrupted = True
+                            break
+                        continue
+                    for f in done:
+                        futures.remove(f)
+                        pid, lean_line, full_line, err = f.result()
+                        if err is None:
+                            if fout_lean is not None and lean_line is not None:
+                                fout_lean.write(lean_line + "\n")
+                            if fout_full is not None and full_line is not None:
+                                fout_full.write(full_line + "\n")
+                            processed += 1
+                        else:
+                            failed += 1
+                            if pid:
+                                sys.stderr.write(f"[warn] failed on {pid}: {err}\n")
+                        pbar.update(1)
+                        if args.limit and processed >= args.limit:
+                            break
+                    if args.limit and processed >= args.limit:
+                        break
+                if args.limit and processed >= args.limit:
+                    break
+                if _STOP_EVENT.is_set():
+                    interrupted = True
+                    break
+
+                maybe_submit(rec)
+
+            # Drain remaining futures
+            for f in as_completed(list(futures)):
+                if _STOP_EVENT.is_set():
+                    interrupted = True
+                    break
                 pid, lean_line, full_line, err = f.result()
                 if err is None:
                     if fout_lean is not None and lean_line is not None:
                         fout_lean.write(lean_line + "\n")
                     if fout_full is not None and full_line is not None:
                         fout_full.write(full_line + "\n")
-                    processed += 1  # count per paper
+                    processed += 1
                 else:
                     failed += 1
                     if pid:
                         sys.stderr.write(f"[warn] failed on {pid}: {err}\n")
                 pbar.update(1)
-                if args.limit and processed >= args.limit:
-                    break
-            if args.limit and processed >= args.limit:
-                break
+    except KeyboardInterrupt:
+        interrupted = True
+        _STOP_EVENT.set()
+    finally:
+        # Cancel pending tasks to stop quickly
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)  # type: ignore[arg-type]
+        except TypeError:
+            executor.shutdown(wait=False)
 
-        # Flush remaining futures
-        for f in as_completed(list(futures)):
-            pid, lean_line, full_line, err = f.result()
-            if err is None:
-                if fout_lean is not None and lean_line is not None:
-                    fout_lean.write(lean_line + "\n")
-                if fout_full is not None and full_line is not None:
-                    fout_full.write(full_line + "\n")
-                processed += 1
-            else:
-                failed += 1
-                if pid:
-                    sys.stderr.write(f"[warn] failed on {pid}: {err}\n")
-            pbar.update(1)
-
-    executor.shutdown(wait=True)
     if fout_lean is not None:
         fout_lean.close()
     if fout_full is not None:
@@ -421,6 +463,7 @@ def main() -> None:
         "start": start_i,
         "end": end_i,
         "workers": max_workers,
+        "interrupted": interrupted,
         "output": os.path.abspath(args.output) if args.output else None,
         "full_output": os.path.abspath(args.full_output) if args.full_output else None,
     }
