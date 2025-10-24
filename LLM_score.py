@@ -27,6 +27,7 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, Optional, Tuple, Callable
+import re
 
 # ---------- Fast JSON (no dependency checks) ----------
 import orjson as _orjson
@@ -185,6 +186,39 @@ def ensure_json(s: str) -> Optional[Dict[str, Any]]:
         return None
     return None
 
+_THINK_RE = re.compile(r"<\s*think\s*>.*?<\s*/\s*think\s*>", re.IGNORECASE | re.DOTALL)
+
+def strip_thinking(text: str) -> str:
+    """Remove typical reasoning model <think>...</think> blocks from text.
+    Keeps everything else untouched.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    return _THINK_RE.sub("", text)
+
+_JS_LINE_COMMENT_RE = re.compile(r"(^|[^:])//.*?$", re.MULTILINE)
+_JS_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+def try_lenient_json(s: str) -> Optional[Dict[str, Any]]:
+    """Attempt to coerce slightly-invalid JSON (comments, trailing commas) into valid JSON."""
+    if not isinstance(s, str) or not s:
+        return None
+    # Extract potential JSON object
+    i, j = s.find("{"), s.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    frag = s[i:j+1]
+    # Remove JS-style comments
+    frag = _JS_BLOCK_COMMENT_RE.sub("", frag)
+    frag = _JS_LINE_COMMENT_RE.sub(lambda m: (m.group(1) or ""), frag)
+    # Remove trailing commas
+    frag = _TRAILING_COMMA_RE.sub(r"\1", frag)
+    try:
+        return jloads(frag)
+    except Exception:
+        return None
+
 def normalize_scores(obj: Dict[str, Any]) -> Dict[str, int]:
     scores = obj.get("scores") if isinstance(obj, dict) else None
     if not isinstance(scores, dict):
@@ -262,6 +296,7 @@ def call_ollama(
     timeout: float,
     backend: str,
     keep_alive: str | int | float,
+    hide_thinking: bool,
 ) -> Dict[str, Any]:
     last: Optional[Exception] = None
     raw: str = ""
@@ -288,7 +323,15 @@ def call_ollama(
                     },
                 )
                 r.raise_for_status()
-                raw = r.json().get("response", "")
+                resp_json = r.json()
+                raw = resp_json.get("response", "")
+                if not raw:
+                    # Some server versions might not use 'response'; keep a fallback for debugging
+                    alt = resp_json.get("message") or resp_json.get("content") or ""
+                    if isinstance(alt, str):
+                        raw = alt
+                if hide_thinking:
+                    raw = strip_thinking(raw)
             else:
                 cl = _get_ollama_client(base_url)
                 data = cl.generate(
@@ -305,11 +348,49 @@ def call_ollama(
                     },
                 )
                 raw = data.get("response", "")
+                if not raw:
+                    alt = data.get("message") or data.get("content") or ""
+                    if isinstance(alt, str):
+                        raw = alt
+                if hide_thinking:
+                    raw = strip_thinking(raw)
             obj = ensure_json(raw)
+            if obj is None:
+                # Fallbacks for thinking models that may place content in a 'thinking' field
+                alt_sources: list[str] = []
+                try:
+                    if backend == "httpx":
+                        t = resp_json.get("thinking")
+                        if isinstance(t, str):
+                            alt_sources.append(t)
+                    else:
+                        t = data.get("thinking")
+                        if isinstance(t, str):
+                            alt_sources.append(t)
+                except Exception:
+                    pass
+                # Also try lenient parsing on raw and alternatives
+                for src in [raw] + alt_sources:
+                    got = try_lenient_json(src)
+                    if got is not None:
+                        obj = got
+                        break
             if obj is None:
                 # Include the raw model output in the error so callers can print it
                 # Truncate very long outputs to avoid overwhelming the console
-                snippet = raw if len(raw) <= 4000 else (raw[:4000] + "\n... [truncated]")
+                # If raw is empty, include the whole response container for debugging
+                container_hint = ""
+                try:
+                    if backend == "httpx":
+                        container_hint = jdumps(resp_json)
+                    else:
+                        container_hint = jdumps(data)
+                except Exception:
+                    pass
+                snippet_raw = raw if raw else container_hint
+                if snippet_raw is None:
+                    snippet_raw = ""
+                snippet = snippet_raw if len(snippet_raw) <= 4000 else (snippet_raw[:4000] + "\n... [truncated]")
                 raise ValueError(f"model did not return valid JSON. Raw response:\n{snippet}")
             return obj
         except Exception as e:
@@ -343,6 +424,7 @@ def process_record(
             timeout=args.timeout,
             backend=args.backend,
             keep_alive=args.keep_alive,
+            hide_thinking=bool(getattr(args, "hidethinking", False)),
         )
     except Exception as e:
         # Return the error string; outer loop will log a warning including the raw response if present
@@ -376,6 +458,7 @@ def warmup(args: argparse.Namespace) -> None:
             timeout=min(30.0, args.timeout),
             backend=args.backend,
             keep_alive=args.keep_alive,
+            hide_thinking=bool(getattr(args, "hidethinking", False)),
         )
     except Exception:
         pass
@@ -397,6 +480,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-ctx", type=int, default=8192)
     p.add_argument("--num-predict", type=int, default=256)
     p.add_argument("--no-rationale", action="store_true")
+    p.add_argument("--hidethinking", action="store_true", help="Hide chain-of-thought from thinking models and strip <think> blocks before JSON parsing")
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--timeout", type=float, default=120.0)
     p.add_argument("--keep-alive", type=str, default="5m", help="Keep model hot between calls (e.g., 5m, 0, -1)")
@@ -422,6 +506,10 @@ def main() -> None:
     if not os.path.exists(args.inp):
         print(f"Input not found: {args.inp}", file=sys.stderr)
         sys.exit(1)
+
+    # If using hidethinking, prefer the official client backend which handles reasoning responses better
+    if getattr(args, "hidethinking", False) and args.backend == "httpx":
+        args.backend = "ollama"
 
     # Start dedicated Ollama server with requested parallelism
     port = args.port or find_free_port(args.host)
