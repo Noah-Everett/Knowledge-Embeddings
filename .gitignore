@@ -12,7 +12,9 @@ __pycache__/
 
 # Data artifacts (large/generated)
 # ArXiv dumps
-arxiv-*.jsonl
+*.jsonl
+*.json
+*.csv
 
 # Model/checkpoint files
 *.ckpt
