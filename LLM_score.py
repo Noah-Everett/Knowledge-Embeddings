@@ -264,6 +264,7 @@ def call_ollama(
     keep_alive: str | int | float,
 ) -> Dict[str, Any]:
     last: Optional[Exception] = None
+    raw: str = ""
     for attempt in range(1, retries + 1):
         if _STOP.is_set():
             raise RuntimeError("shutdown requested")
@@ -306,7 +307,10 @@ def call_ollama(
                 raw = data.get("response", "")
             obj = ensure_json(raw)
             if obj is None:
-                raise ValueError("model did not return valid JSON")
+                # Include the raw model output in the error so callers can print it
+                # Truncate very long outputs to avoid overwhelming the console
+                snippet = raw if len(raw) <= 4000 else (raw[:4000] + "\n... [truncated]")
+                raise ValueError(f"model did not return valid JSON. Raw response:\n{snippet}")
             return obj
         except Exception as e:
             last = e
@@ -327,18 +331,22 @@ def process_record(
         return None, None, None, "missing required fields"
 
     prompt = prompt_fn(title, abstract, not args.no_rationale)
-    obj = call_ollama(
-        model=args.model,
-        prompt=prompt,
-        base_url=args.ollama_url,
-        retries=args.retries,
-        temperature=args.temperature,
-        num_ctx=args.num_ctx,
-        num_predict=args.num_predict,
-        timeout=args.timeout,
-        backend=args.backend,
-        keep_alive=args.keep_alive,
-    )
+    try:
+        obj = call_ollama(
+            model=args.model,
+            prompt=prompt,
+            base_url=args.ollama_url,
+            retries=args.retries,
+            temperature=args.temperature,
+            num_ctx=args.num_ctx,
+            num_predict=args.num_predict,
+            timeout=args.timeout,
+            backend=args.backend,
+            keep_alive=args.keep_alive,
+        )
+    except Exception as e:
+        # Return the error string; outer loop will log a warning including the raw response if present
+        return pid, None, None, str(e)
     scores = normalize_scores(obj)
     lean = {"id": pid, "title": title, "scores": scores, "model": args.model}
     if not args.no_rationale:
